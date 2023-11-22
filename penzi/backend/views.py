@@ -1,3 +1,10 @@
+from rest_framework.views import APIView
+# from .views import MessageReceiveView
+import xml.etree.ElementTree as ET
+from django.http import HttpResponse
+from django.views.decorators.csrf import csrf_exempt
+from twilio.twiml.messaging_response import MessagingResponse
+from twilio.rest import Client
 from rest_framework import generics, status
 from rest_framework.response import Response
 from .models import ReceivedMessage, User, UserProfile, UserDetails, UserDescription
@@ -5,6 +12,56 @@ from .serializers import ReceivedMessageSerializer, UserSerializer, UserProfileS
 from django.core.cache import cache
 from datetime import timedelta
 from django.utils import timezone
+
+class TwilioResponseView(APIView):
+    def post(self, request):
+        incoming_message = request.data.get('Body', '').lower()
+        phone_number = request.data.get('From')
+
+        if phone_number and phone_number.startswith('whatsapp:'):
+            phone_number = phone_number[len('whatsapp:'):]
+            user = User.objects.filter(phone_number=phone_number).first()
+
+            if user:
+                message_receive_view = MessageReceiveView()
+                response_data = message_receive_view.process_message(user, incoming_message)
+
+                if 'status' in response_data:
+                    cleaned_response = self.clean_response(response_data['status'])
+                    self.send_whatsapp_message(phone_number, cleaned_response)
+                    return HttpResponse()
+
+        return HttpResponse()
+
+    def clean_response(self, response_text):
+        # Assuming the response_text is not always in XML format
+        try:
+            # Parse XML content if it is XML
+            root = ET.fromstring(response_text)
+            message = root.find('Message').text.strip()  # Extract message text
+            return message
+        except ET.ParseError:
+            return response_text  # Return the original text if there's an XML parsing error
+
+    def send_whatsapp_message(self, phone_number, message):
+        # Send the cleaned message using Twilio
+        TWILIO_ACCOUNT_SID = 'ACf8b960bcd99bb3036ff6e48b0c3ba6b8'
+        TWILIO_AUTH_TOKEN = '9d2b2cc572b9be82ff08120c63f0c877'
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+        # Create a MessagingResponse and add the message
+        twilio_response = MessagingResponse()
+        twilio_response.message(message)
+
+        # Get the string representation of the response
+        twilio_response_str = str(twilio_response)
+
+        # Send the message using Twilio
+        client.messages.create(
+            body=twilio_response_str,
+            from_='whatsapp:+14155238886',
+            to=f'whatsapp:{phone_number}'
+        )
 
 class MessageReceiveView(generics.CreateAPIView):
     serializer_class = ReceivedMessageSerializer
