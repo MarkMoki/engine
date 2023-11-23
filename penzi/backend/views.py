@@ -1,7 +1,7 @@
 from rest_framework.views import APIView
-# from .views import MessageReceiveView
+from django.db.models import Q
 import xml.etree.ElementTree as ET
-from django.http import HttpResponse
+from django.http import HttpResponse, HttpRequest
 from django.views.decorators.csrf import csrf_exempt
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
@@ -15,16 +15,37 @@ from django.utils import timezone
 
 class TwilioResponseView(APIView):
     def post(self, request):
-        incoming_message = request.data.get('Body', '').lower()
-        phone_number = request.data.get('From')
+        incoming_message = request.POST.get('Body', '').lower()
+        phone_number = request.POST.get('From')
 
         if phone_number and phone_number.startswith('whatsapp:'):
             phone_number = phone_number[len('whatsapp:'):]
-            user = User.objects.filter(phone_number=phone_number).first()
+            user = None
+
+            # Attempt to find a User object associated with the provided phone_number
+            if len(phone_number) >= 9:
+                last_nine_digits = phone_number[-9:]
+                user = User.objects.filter(
+                    Q(phone_number__endswith=last_nine_digits)
+                ).first()
+
+            if not user:
+                user = User.objects.filter(
+                    phone_number=phone_number
+                ).first()
 
             if user:
                 message_receive_view = MessageReceiveView()
-                response_data = message_receive_view.process_message(user, incoming_message)
+
+                simulated_request_data = {
+                    'phone_number': phone_number,
+                    'message': incoming_message
+                }
+                simulated_request = HttpRequest()
+                simulated_request.method = 'POST'
+                simulated_request.data = simulated_request_data
+
+                response_data = message_receive_view.create(simulated_request)
 
                 if 'status' in response_data:
                     cleaned_response = self.clean_response(response_data['status'])
@@ -34,34 +55,29 @@ class TwilioResponseView(APIView):
         return HttpResponse()
 
     def clean_response(self, response_text):
-        # Assuming the response_text is not always in XML format
         try:
-            # Parse XML content if it is XML
             root = ET.fromstring(response_text)
-            message = root.find('Message').text.strip()  # Extract message text
+            message = root.find('Message').text.strip()
             return message
         except ET.ParseError:
-            return response_text  # Return the original text if there's an XML parsing error
+            return response_text
 
     def send_whatsapp_message(self, phone_number, message):
-        # Send the cleaned message using Twilio
-        TWILIO_ACCOUNT_SID = 'ACf8b960bcd99bb3036ff6e48b0c3ba6b8'
-        TWILIO_AUTH_TOKEN = '9d2b2cc572b9be82ff08120c63f0c877'
-        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        account_sid = 'ACf8b960bcd99bb3036ff6e48b0c3ba6b8'
+        auth_token = '574f801b9bdc06a4fde300381e359081'
+        client = Client(account_sid, auth_token)
 
-        # Create a MessagingResponse and add the message
         twilio_response = MessagingResponse()
         twilio_response.message(message)
 
-        # Get the string representation of the response
         twilio_response_str = str(twilio_response)
 
-        # Send the message using Twilio
-        client.messages.create(
-            body=twilio_response_str,
+        message = client.messages.create(
             from_='whatsapp:+14155238886',
+            body=twilio_response_str,
             to=f'whatsapp:{phone_number}'
         )
+
 
 class MessageReceiveView(generics.CreateAPIView):
     serializer_class = ReceivedMessageSerializer
@@ -70,6 +86,11 @@ class MessageReceiveView(generics.CreateAPIView):
         phone_number = request.data.get('phone_number')
         message = request.data.get('message')
 
+        # Ensure that a phone_number is provided
+        if not phone_number:
+            return Response("Phone number is required.", status=400)
+
+        # Create or get the user based on the provided phone number
         user, created = User.objects.get_or_create(phone_number=phone_number)
 
         # Process the message and determine the response based on user registration status and message content
@@ -171,14 +192,19 @@ class MessageReceiveView(generics.CreateAPIView):
             except ValueError:
                 return Response("Invalid format. Please provide information in the format 'match#age_range#county'", status=400)
 
-            if user.profile.gender.lower() == 'female':
+            # Gender filtering logic
+            user_gender = user.profile.gender.lower().strip()  # Assuming user profile gender is a single word
+
+            if user_gender == 'female':
                 gender_filter = 'male'
                 gender_display = 'gentlemen'
                 gender_type = 'man'
-            else:
+            elif user_gender == 'male':
                 gender_filter = 'female'
                 gender_display = 'ladies'
                 gender_type = 'lady'
+            else:
+                return response_data['status']("Your gender preference is not recognized. To register SMS start#name#age#gender#county#town to 22141.", status=400)
 
             matching_users = UserProfile.objects.filter(
                 age__gte=min_age,
@@ -197,16 +223,35 @@ class MessageReceiveView(generics.CreateAPIView):
 
             ReceivedMessage.objects.create(user=user, message=message)
 
-            # Send the initial response about matches
-            return Response(response_data)
+            # Display the first three matches as a separate response
+            if matching_users_count > 0:
+                first_three_matches = matching_users[:3]
+                if first_three_matches:
+                    first_three_response = "Here are the first three matches: "
+                    for match in first_three_matches:
+                        match_info = f"Name: {match.name}, Age: {match.age}, Phone Number: {match.user.phone_number}"
+                        first_three_response += f"{match_info} "
+                else:
+                    first_three_response = "There are no matches available at the moment."
+
+                response_data_first_three = {'status': first_three_response}
+
+                # Return the responses
+                return Response([response_data, response_data_first_three])
+
+            # Add any other handling or response here if needed
+            return Response("There are no matches available at the moment. Try later!")
 
         elif message.lower() == 'next' and user.is_registered:
             displayed_matches_key = f"displayed_matches_{user.id}"
             displayed_matches = cache.get(displayed_matches_key, [])
 
+            # Get remaining matches excluding first three and already displayed matches
             remaining_matches = UserProfile.objects.filter(
                 user__is_registered=True
-            ).exclude(user__id__in=displayed_matches)
+            ).exclude(user__id__in=displayed_matches).exclude(
+                id__in=UserProfile.objects.filter(user__id__in=displayed_matches)[:3]
+            )
 
             response_data = {}
 
@@ -214,10 +259,10 @@ class MessageReceiveView(generics.CreateAPIView):
                 next_three_matches = remaining_matches[:3]
 
                 if next_three_matches:
-                    response_data['status'] = "Here are the next three matches:\n"
+                    response_data['status'] = "Here are the next three matches: "
                     for match in next_three_matches:
                         match_info = f"Name: {match.name}, Age: {match.age}, Phone Number: {match.user.phone_number}"
-                        response_data['status'] += f"{match_info}\n"
+                        response_data['status'] += f"{match_info} "
                         displayed_matches.append(match.user_id)
 
                     cache.set(displayed_matches_key, displayed_matches)
@@ -230,6 +275,7 @@ class MessageReceiveView(generics.CreateAPIView):
 
             # Send the response for the 'next' message
             return Response(response_data)
+
         
         elif message.isdigit() and len(message) == 10:  # Check if it's a match number
                 match_phone_number = message
@@ -297,9 +343,9 @@ class MessageReceiveView(generics.CreateAPIView):
                 # Check if the user is interested in this match
                 user_interested = cache.get(f"user_{user.id}_interested_in_match_{match_profile.user.id}", False)
                 if user_interested:
-                    response_data['status'] += f"\nSend YES to 22141 if you want to know more about {match_profile.name}."
+                    response_data['status'] += f" Send YES to 22141 if you want to know more about {match_profile.name}."
                 else:
-                    response_data['status'] += f"\nYou have not shown interest in {match_profile.name}."
+                    response_data['status'] += f" You have not shown interest in {match_profile.name}."
                     
                 ReceivedMessage.objects.create(user=user, message=message)
 
